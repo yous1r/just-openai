@@ -33,9 +33,11 @@ go build -buildmode=c-shared -o ../bin/openai-anthropic-messages.dll .
 ```
 
 Linux/macOS users build with the matching `GOOS`/`GOARCH` and `.so`/`.dylib`
-output. Pushing a `v*` tag (for example `v0.1.0`) triggers the `release-linux`
-workflow, which builds the Linux `.so` archives for amd64 and arm64 and
-attaches them to the GitHub release for that tag. The output basename must
+output. Pushing a `v*` tag (for example `v0.2.0`) triggers the `release-linux`
+workflow, which cross-compiles the Linux `.so` for amd64 and arm64 against
+musl with static linking (`-extldflags=-static`): the artifact has no dynamic
+libc dependency and loads on both glibc and musl (Alpine etc.) hosts. Archives
+are attached to the GitHub release for that tag. The output basename must
 remain `openai-anthropic-messages` so it matches the config key.
 
 ## Configure

@@ -46,19 +46,17 @@ jobs:
           fi
 
   build-linux:
-    name: build linux-${{ matrix.goarch }}
+    name: build linux-${{ matrix.goarch }} (musl static)
     needs: [test, prepare-release]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - goarch: amd64
-            runner: ubuntu-latest
-            manylinux_image: quay.io/pypa/manylinux2014_x86_64
+            musl_triple: x86_64-linux-musl
           - goarch: arm64
-            runner: ubuntu-24.04-arm
-            manylinux_image: quay.io/pypa/manylinux2014_aarch64
+            musl_triple: aarch64-linux-musl
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -66,33 +64,24 @@ jobs:
         env:
           GO_VERSION: ${{ env.GO_VERSION }}
           GOARCH: ${{ matrix.goarch }}
-          MANYLINUX_IMAGE: ${{ matrix.manylinux_image }}
+          MUSL_TRIPLE: ${{ matrix.musl_triple }}
         run: |
           set -euo pipefail
           rm -rf dist
           mkdir -p dist
-          # manylinux2014 carries a devtoolset GCC, so the resulting .so keeps
-          # the same GLIBC 2.17 baseline as the official CLIProxyAPI Linux builds.
-          docker run --rm \
-            -v "$PWD:/src" \
-            -w /src \
-            -e GO_VERSION \
-            -e GOARCH \
-            "$MANYLINUX_IMAGE" \
-            bash -euo pipefail -c '
-              set -euo pipefail
-              go_archive="go${GO_VERSION}.linux-${GOARCH}.tar.gz"
-              curl -fsSL "https://go.dev/dl/${go_archive}" -o "/tmp/${go_archive}"
-              rm -rf /tmp/go
-              mkdir -p /tmp/go
-              tar -C /tmp/go -xzf "/tmp/${go_archive}"
-              export PATH="/tmp/go/go/bin:${PATH}"
-              export GOCACHE=/tmp/gocache GOPATH=/tmp/gopath
-              cd go
-              CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" \
-                go build -buildvcs=false -buildmode=c-shared -o /src/dist/openai-anthropic-messages.so .
-              rm -f /src/dist/openai-anthropic-messages.h
-            '
+          # musl.cc cross toolchain: statically linked against musl, so the .so
+          # has no dynamic libc dependency and loads on glibc and musl hosts.
+          curl -fsSL "https://musl.cc/${MUSL_TRIPLE}-cross.tgz" -o /tmp/musl-cross.tgz
+          rm -rf "/tmp/${MUSL_TRIPLE}-cross"
+          tar -C /tmp -xzf /tmp/musl-cross.tgz
+          export PATH="/tmp/${MUSL_TRIPLE}-cross/bin:${PATH}"
+          export GOCACHE=/tmp/gocache GOPATH=/tmp/gopath
+          cd go
+          CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" CC="${MUSL_TRIPLE}-gcc" \
+            go build -buildvcs=false \
+            -ldflags="-extldflags=-static" \
+            -buildmode=c-shared -o "$GITHUB_WORKSPACE/dist/openai-anthropic-messages.so" .
+          rm -f "$GITHUB_WORKSPACE/dist/openai-anthropic-messages.h"
       - name: Package archive
         run: |
           set -euo pipefail
