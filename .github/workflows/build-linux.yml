@@ -95,7 +95,7 @@ jobs:
               cd go
               CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" CC=gcc \
                 go build -buildvcs=false \
-                -ldflags="-extldflags=-static" \
+                -ldflags="-extldflags=-static-libgcc" \
                 -buildmode=c-shared -o /src/dist/openai-anthropic-messages.so .
               rm -f /src/dist/openai-anthropic-messages.h
             '
