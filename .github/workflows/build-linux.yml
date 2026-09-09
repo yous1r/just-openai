@@ -90,7 +90,7 @@ jobs:
               export GOCACHE=/tmp/gocache GOPATH=/tmp/gopath
               cd go
               CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" \
-                go build -buildmode=c-shared -o /src/dist/openai-anthropic-messages.so .
+                go build -buildvcs=false -buildmode=c-shared -o /src/dist/openai-anthropic-messages.so .
               rm -f /src/dist/openai-anthropic-messages.h
             '
       - name: Package archive
