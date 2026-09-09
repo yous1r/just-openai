@@ -378,7 +378,7 @@ func pluginRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             pluginIdentifier,
-			Version:          "0.2.0",
+			Version:          "0.3.0",
 			Author:           "router-for-me",
 			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
 			ConfigFields: []pluginapi.ConfigField{
