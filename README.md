@@ -34,11 +34,10 @@ go build -buildmode=c-shared -o ../bin/openai-anthropic-messages.dll .
 
 Linux/macOS users build with the matching `GOOS`/`GOARCH` and `.so`/`.dylib`
 output. Pushing a `v*` tag (for example `v0.2.0`) triggers the `release-linux`
-workflow, which cross-compiles the Linux `.so` for amd64 and arm64 against
-musl (pypa musllinux image) with libgcc embedded statically
-(`-static-libgcc`): the artifact depends only on `libc.musl`, so it loads on
-musl hosts such as Alpine and other minimal containers, matching the
-plugin-store artifacts. Archives are attached to the GitHub release for that
+workflow, which cross-compiles the Linux `.so` for amd64 and arm64 in a pypa
+manylinux2014 container: the glibc 2.17 baseline means the artifact loads on
+any glibc host, matching the official Release binary (which is what the
+pluginhost dlopens). Archives are attached to the GitHub release for that
 tag. The output basename must remain `openai-anthropic-messages` so it
 matches the config key.
 
