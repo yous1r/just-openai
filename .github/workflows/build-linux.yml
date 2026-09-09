@@ -90,8 +90,8 @@ jobs:
             -e GOCACHE=/tmp/gocache \
             -e GOPATH=/tmp/gopath \
             "$IMAGE" \
-            bash -euo pipefail -c '
-              set -euo pipefail
+            sh -euc '
+              set -eu
               cd go
               CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" CC=gcc \
                 go build -buildvcs=false \
