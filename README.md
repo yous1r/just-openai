@@ -21,14 +21,22 @@ If `base_api` already ends in `/v1`, the plugin does not add it again.
 
 ## Build
 
+This repository is the standalone plugin module. Its Go module depends on the
+published CLIProxyAPI v7 SDK (`github.com/router-for-me/CLIProxyAPI/v7`), so it
+builds without the CLIProxyAPI source tree.
+
 From the repository root:
 
 ```powershell
-cd examples/plugin/openai-anthropic-messages/go
-go build -buildmode=c-shared -o ../../bin/openai-anthropic-messages.dll .
+cd go
+go build -buildmode=c-shared -o ../bin/openai-anthropic-messages.dll .
 ```
 
-Linux/macOS users should use `.so`/`.dylib`. The output basename must remain `openai-anthropic-messages` so it matches the config key.
+Linux/macOS users build with the matching `GOOS`/`GOARCH` and `.so`/`.dylib`
+output. Pushing a `v*` tag (for example `v0.1.0`) triggers the `release-linux`
+workflow, which builds the Linux `.so` archives for amd64 and arm64 and
+attaches them to the GitHub release for that tag. The output basename must
+remain `openai-anthropic-messages` so it matches the config key.
 
 ## Configure
 
