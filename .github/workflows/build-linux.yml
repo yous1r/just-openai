@@ -93,8 +93,10 @@ jobs:
             "$IMAGE" \
             sh -euc '
               set -eu
-              # manylinux2014 ships gcc in devtoolset-10, not on PATH
-              . /opt/rh/devtoolset-10/enable
+              # manylinux2014 ships gcc under devtoolset-10, not on PATH.
+              # (the devtoolset enable script cannot run under set -u: it
+              # expands MANPATH which is unset in this container)
+              export PATH="/opt/rh/devtoolset-10/root/usr/bin:${PATH}"
               command -v gcc >/dev/null || { echo "gcc not found"; exit 1; }
               cd go
               CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" CC=gcc \
