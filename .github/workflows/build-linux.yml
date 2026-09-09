@@ -48,40 +48,57 @@ jobs:
   build-linux:
     name: build linux-${{ matrix.goarch }} (musl static)
     needs: [test, prepare-release]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - goarch: amd64
-            musl_triple: x86_64-linux-musl
+            runner: ubuntu-latest
+            image: quay.io/pypa/musllinux_1_2_x86_64
           - goarch: arm64
-            musl_triple: aarch64-linux-musl
+            runner: ubuntu-24.04-arm
+            image: quay.io/pypa/musllinux_1_2_aarch64
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ env.PLUGIN_MODULE }}/go.sum
       - name: Build shared library
         env:
-          GO_VERSION: ${{ env.GO_VERSION }}
           GOARCH: ${{ matrix.goarch }}
-          MUSL_TRIPLE: ${{ matrix.musl_triple }}
+          IMAGE: ${{ matrix.image }}
         run: |
           set -euo pipefail
           rm -rf dist
           mkdir -p dist
-          # musl.cc cross toolchain: statically linked against musl, so the .so
-          # has no dynamic libc dependency and loads on glibc and musl hosts.
-          curl -fsSL "https://musl.cc/${MUSL_TRIPLE}-cross.tgz" -o /tmp/musl-cross.tgz
-          rm -rf "/tmp/${MUSL_TRIPLE}-cross"
-          tar -C /tmp -xzf /tmp/musl-cross.tgz
-          export PATH="/tmp/${MUSL_TRIPLE}-cross/bin:${PATH}"
-          export GOCACHE=/tmp/gocache GOPATH=/tmp/gopath
-          cd go
-          CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" CC="${MUSL_TRIPLE}-gcc" \
-            go build -buildvcs=false \
-            -ldflags="-extldflags=-static" \
-            -buildmode=c-shared -o "$GITHUB_WORKSPACE/dist/openai-anthropic-messages.so" .
-          rm -f "$GITHUB_WORKSPACE/dist/openai-anthropic-messages.h"
+          # pypa musllinux image: Alpine-based with a musl gcc. Statically
+          # linked, so the .so has no dynamic libc dependency and loads on
+          # both glibc and musl hosts. The Go toolchain is mounted from the
+          # runner (no in-container downloads).
+          go_root="$(go env GOROOT)"
+          docker run --rm \
+            -v "$PWD:/src" \
+            -v "${go_root}:${go_root}" \
+            -w /src \
+            -e PATH="$PATH" \
+            -e GOROOT="${go_root}" \
+            -e GOARCH="$GOARCH" \
+            -e GOCACHE=/tmp/gocache \
+            -e GOPATH=/tmp/gopath \
+            "$IMAGE" \
+            bash -euo pipefail -c '
+              set -euo pipefail
+              cd go
+              CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" CC=gcc \
+                go build -buildvcs=false \
+                -ldflags="-extldflags=-static" \
+                -buildmode=c-shared -o /src/dist/openai-anthropic-messages.so .
+              rm -f /src/dist/openai-anthropic-messages.h
+            '
       - name: Package archive
         run: |
           set -euo pipefail
