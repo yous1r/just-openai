@@ -65,6 +65,7 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -117,6 +118,11 @@ type modelConfig struct {
 	DisplayName     string `yaml:"display_name" json:"display_name,omitempty"`
 	ContextLength   int64  `yaml:"context_length" json:"context_length,omitempty"`
 	MaxOutputTokens int64  `yaml:"max_output_tokens" json:"max_output_tokens,omitempty"`
+	// Stream pins the upstream Messages request mode for this model.
+	// Unset follows the client request; true always streams upstream and
+	// aggregates for non-streaming clients; false never streams upstream and
+	// synthesizes a Claude SSE stream for streaming clients.
+	Stream *bool `yaml:"stream" json:"stream,omitempty"`
 }
 
 type registration struct {
@@ -378,7 +384,7 @@ func pluginRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             pluginIdentifier,
-			Version:          "0.3.0",
+			Version:          "0.4.0",
 			Author:           "router-for-me",
 			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
 			ConfigFields: []pluginapi.ConfigField{
@@ -389,7 +395,7 @@ func pluginRegistration() registration {
 				{Name: "auth_header", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"x-api-key", "bearer", "both"}, Description: "Authentication header style expected by the upstream."},
 				{Name: "anthropic_version", Type: pluginapi.ConfigFieldTypeString, Description: "Anthropic-Version header; defaults to 2023-06-01."},
 				{Name: "prefix", Type: pluginapi.ConfigFieldTypeString, Description: "Optional public model prefix, for example omp creates omp/model-name."},
-				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Models: [{name, alias, display_name, context_length, max_output_tokens}]. name is sent upstream; alias is exposed publicly."},
+				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Models: [{name, alias, display_name, context_length, max_output_tokens, stream}]. name is sent upstream; alias is exposed publicly. stream pins the upstream Messages mode per model: unset follows the client request, true always streams upstream (non-streaming clients get the aggregated message), false never streams upstream (streaming clients get synthesized Claude SSE)."},
 				{Name: "headers", Type: pluginapi.ConfigFieldTypeObject, Description: "Optional additional upstream request headers."},
 			},
 		},
@@ -504,14 +510,41 @@ func modelWithoutThinkingSuffix(model string) string {
 	return model
 }
 
-func resolveUpstreamModel(cfg pluginConfig, requested string) (string, bool) {
+func resolveModelConfig(cfg pluginConfig, requested string) (modelConfig, bool) {
 	requested = modelWithoutThinkingSuffix(requested)
 	for _, model := range cfg.Models {
 		if requested == publicModelID(cfg, model) {
-			return model.Name, true
+			return model, true
 		}
 	}
-	return "", false
+	return modelConfig{}, false
+}
+
+func resolveUpstreamModel(cfg pluginConfig, requested string) (string, bool) {
+	model, ok := resolveModelConfig(cfg, requested)
+	if !ok {
+		return "", false
+	}
+	return model.Name, true
+}
+
+// upstreamStreamMode reports whether the upstream Messages request must be sent
+// with stream=true. An unset pin follows the client request.
+func upstreamStreamMode(model modelConfig, clientStream bool) bool {
+	if model.Stream == nil {
+		return clientStream
+	}
+	return *model.Stream
+}
+
+func streamModeLabel(model modelConfig) string {
+	if model.Stream == nil {
+		return "client"
+	}
+	if *model.Stream {
+		return "always"
+	}
+	return "never"
 }
 
 func execute(raw []byte) ([]byte, error) {
@@ -520,11 +553,14 @@ func execute(raw []byte) ([]byte, error) {
 		return nil, errUnmarshal
 	}
 	cfg := loadedConfig()
-	upstreamModel, ok := resolveUpstreamModel(cfg, request.Model)
+	model, ok := resolveModelConfig(cfg, request.Model)
 	if !ok || !configRunnable(cfg) {
 		return errorEnvelope("model_not_configured", "model is not configured for this plugin", http.StatusBadRequest), nil
 	}
-	payload, errPayload := prepareAnthropicPayload(request.Payload, upstreamModel, false)
+	if upstreamStreamMode(model, false) {
+		return executeAggregatedResponse(cfg, model.Name, request)
+	}
+	payload, errPayload := prepareAnthropicPayload(request.Payload, model.Name, false)
 	if errPayload != nil {
 		return errorEnvelope("invalid_request", errPayload.Error(), http.StatusBadRequest), nil
 	}
@@ -548,6 +584,45 @@ func execute(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: upstream.Body, Headers: upstream.Headers})
 }
 
+// executeAggregatedResponse serves a non-streaming client from an upstream that is
+// pinned to streaming: it drains the Messages SSE stream and folds it back into a
+// single Claude message body so the client sees the shape it asked for.
+func executeAggregatedResponse(cfg pluginConfig, upstreamModel string, request rpcExecutorRequest) ([]byte, error) {
+	payload, errPayload := prepareAnthropicPayload(request.Payload, upstreamModel, true)
+	if errPayload != nil {
+		return errorEnvelope("invalid_request", errPayload.Error(), http.StatusBadRequest), nil
+	}
+	response, errCall := callHostHTTP(pluginabi.MethodHostHTTPDoStream, hostHTTPRequest{
+		HostCallbackID: request.HostCallbackID,
+		Method:         http.MethodPost,
+		URL:            messagesURL(cfg.BaseAPI),
+		Headers:        upstreamHeaders(cfg),
+		Body:           payload,
+	})
+	if errCall != nil {
+		return errorEnvelope("upstream_error", errCall.Error(), http.StatusBadGateway), nil
+	}
+	var upstream hostHTTPStreamResponse
+	if errUnmarshal := json.Unmarshal(response, &upstream); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode upstream stream response: %w", errUnmarshal)
+	}
+	if strings.TrimSpace(upstream.StreamID) == "" {
+		return errorEnvelope("stream_unavailable", "upstream returned no stream id", http.StatusBadGateway), nil
+	}
+	stream, errDrain := drainHostHTTPStream(upstream.StreamID, request.HostCallbackID)
+	if errDrain != nil {
+		return errorEnvelope("upstream_error", errDrain.Error(), http.StatusBadGateway), nil
+	}
+	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
+		return upstreamErrorEnvelope(upstream.StatusCode, stream), nil
+	}
+	body, errConvert := claudeStreamToResponse(stream)
+	if errConvert != nil {
+		return errorEnvelope("upstream_error", errConvert.Error(), http.StatusBadGateway), nil
+	}
+	return okEnvelope(pluginapi.ExecutorResponse{Payload: body, Headers: upstream.Headers})
+}
+
 func executeStream(raw []byte) ([]byte, error) {
 	var request rpcExecutorRequest
 	if errUnmarshal := json.Unmarshal(raw, &request); errUnmarshal != nil {
@@ -557,11 +632,14 @@ func executeStream(raw []byte) ([]byte, error) {
 		return errorEnvelope("stream_unavailable", "plugin stream id is required", http.StatusInternalServerError), nil
 	}
 	cfg := loadedConfig()
-	upstreamModel, ok := resolveUpstreamModel(cfg, request.Model)
+	model, ok := resolveModelConfig(cfg, request.Model)
 	if !ok || !configRunnable(cfg) {
 		return errorEnvelope("model_not_configured", "model is not configured for this plugin", http.StatusBadRequest), nil
 	}
-	payload, errPayload := prepareAnthropicPayload(request.Payload, upstreamModel, true)
+	if !upstreamStreamMode(model, true) {
+		return executeSynthesizedStream(cfg, model.Name, request)
+	}
+	payload, errPayload := prepareAnthropicPayload(request.Payload, model.Name, true)
 	if errPayload != nil {
 		return errorEnvelope("invalid_request", errPayload.Error(), http.StatusBadRequest), nil
 	}
@@ -587,6 +665,524 @@ func executeStream(raw []byte) ([]byte, error) {
 	}
 	go forwardHTTPStream(upstream.StreamID, request.StreamID, request.HostCallbackID)
 	return okEnvelope(map[string]any{"headers": upstream.Headers})
+}
+
+// executeSynthesizedStream serves a streaming client from an upstream that is
+// pinned to non-streaming: it replays the single Claude message body as the
+// Claude SSE event sequence the client expects.
+func executeSynthesizedStream(cfg pluginConfig, upstreamModel string, request rpcExecutorRequest) ([]byte, error) {
+	payload, errPayload := prepareAnthropicPayload(request.Payload, upstreamModel, false)
+	if errPayload != nil {
+		return errorEnvelope("invalid_request", errPayload.Error(), http.StatusBadRequest), nil
+	}
+	response, errCall := callHostHTTP(pluginabi.MethodHostHTTPDo, hostHTTPRequest{
+		HostCallbackID: request.HostCallbackID,
+		Method:         http.MethodPost,
+		URL:            messagesURL(cfg.BaseAPI),
+		Headers:        upstreamHeaders(cfg),
+		Body:           payload,
+	})
+	if errCall != nil {
+		return errorEnvelope("upstream_error", errCall.Error(), http.StatusBadGateway), nil
+	}
+	var upstream pluginapi.HTTPResponse
+	if errUnmarshal := json.Unmarshal(response, &upstream); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode upstream response: %w", errUnmarshal)
+	}
+	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
+		return upstreamErrorEnvelope(upstream.StatusCode, upstream.Body), nil
+	}
+	frames, errConvert := claudeResponseToSSEFrames(upstream.Body, upstreamModel)
+	if errConvert != nil {
+		return errorEnvelope("upstream_error", errConvert.Error(), http.StatusBadGateway), nil
+	}
+	go emitSynthesizedStream(frames, request.StreamID, request.HostCallbackID)
+	return okEnvelope(map[string]any{"headers": upstream.Headers})
+}
+
+// drainHostHTTPStream reads a host HTTP stream to completion.
+func drainHostHTTPStream(streamID, callbackID string) ([]byte, error) {
+	var stream bytes.Buffer
+	for {
+		raw, errRead := callHostHTTP(pluginabi.MethodHostHTTPStreamRead, struct {
+			HostCallbackID string `json:"host_callback_id,omitempty"`
+			StreamID       string `json:"stream_id"`
+		}{HostCallbackID: callbackID, StreamID: streamID})
+		if errRead != nil {
+			closeHostHTTPStream(streamID, callbackID)
+			return nil, errRead
+		}
+		var chunk hostHTTPStreamReadResponse
+		if errUnmarshal := json.Unmarshal(raw, &chunk); errUnmarshal != nil {
+			closeHostHTTPStream(streamID, callbackID)
+			return nil, errUnmarshal
+		}
+		if len(chunk.Payload) > 0 {
+			stream.Write(chunk.Payload)
+		}
+		if chunk.Error != "" {
+			closeHostHTTPStream(streamID, callbackID)
+			return nil, fmt.Errorf("%s", chunk.Error)
+		}
+		if chunk.Done {
+			return stream.Bytes(), nil
+		}
+	}
+}
+
+// emitSynthesizedStream pushes pre-built SSE frames to the client stream, one
+// host emit per frame, and closes it.
+func emitSynthesizedStream(frames [][]byte, pluginStreamID, callbackID string) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			closePluginStream(pluginStreamID, fmt.Sprintf("stream synthesis panic: %v", recovered), callbackID)
+		}
+	}()
+	for _, frame := range frames {
+		_, errEmit := callHostHTTP(pluginabi.MethodHostStreamEmit, struct {
+			HostCallbackID string `json:"host_callback_id,omitempty"`
+			pluginStreamEmitRequest
+		}{HostCallbackID: callbackID, pluginStreamEmitRequest: pluginStreamEmitRequest{StreamID: pluginStreamID, Payload: frame}})
+		if errEmit != nil {
+			closePluginStream(pluginStreamID, errEmit.Error(), callbackID)
+			return
+		}
+	}
+	closePluginStream(pluginStreamID, "", callbackID)
+}
+
+// claudeSSEFrame renders one complete SSE event (event name + data + blank line).
+func claudeSSEFrame(event string, payload map[string]any) ([]byte, error) {
+	raw, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("encode %s event: %w", event, errMarshal)
+	}
+	frame := append([]byte("event: "), event...)
+	frame = append(frame, '\n')
+	frame = append(frame, "data: "...)
+	frame = append(frame, raw...)
+	return append(frame, '\n', '\n'), nil
+}
+
+func claudeContentBlockStartFrame(index int, contentBlock map[string]any) ([]byte, error) {
+	return claudeSSEFrame("content_block_start", map[string]any{
+		"type":          "content_block_start",
+		"index":         index,
+		"content_block": contentBlock,
+	})
+}
+
+func claudeContentBlockDeltaFrame(index int, delta map[string]any) ([]byte, error) {
+	return claudeSSEFrame("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": index,
+		"delta": delta,
+	})
+}
+
+// claudeResponseToSSEFrames renders a non-streaming Anthropic Messages body as the
+// Claude SSE event sequence a streaming client expects.
+func claudeResponseToSSEFrames(body []byte, fallbackModel string) ([][]byte, error) {
+	root, errDecode := decodeJSONObject(body)
+	if errDecode != nil {
+		return nil, fmt.Errorf("upstream response must be a JSON object: %w", errDecode)
+	}
+	content, ok := root["content"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("upstream response has no content array")
+	}
+	message := make(map[string]any, len(root))
+	for key, value := range root {
+		switch key {
+		case "content", "stop_reason", "stop_sequence":
+			continue
+		}
+		message[key] = value
+	}
+	message["content"] = []any{}
+	message["stop_reason"] = nil
+	message["stop_sequence"] = nil
+	if blockType, _ := message["type"].(string); strings.TrimSpace(blockType) == "" {
+		message["type"] = "message"
+	}
+	if role, _ := message["role"].(string); strings.TrimSpace(role) == "" {
+		message["role"] = "assistant"
+	}
+	if id, _ := message["id"].(string); strings.TrimSpace(id) == "" {
+		message["id"] = fmt.Sprintf("msg_%d", time.Now().UnixNano())
+	}
+	if model, _ := message["model"].(string); strings.TrimSpace(model) == "" {
+		message["model"] = strings.TrimSpace(fallbackModel)
+	}
+	usage := claudeUsageObject(root["usage"])
+	message["usage"] = usage
+
+	frames := make([][]byte, 0, 2*len(content)+4)
+	startFrame, errStart := claudeSSEFrame("message_start", map[string]any{"type": "message_start", "message": message})
+	if errStart != nil {
+		return nil, errStart
+	}
+	frames = append(frames, startFrame)
+	for index, rawBlock := range content {
+		block, ok := rawBlock.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("upstream response content block %d is not an object", index)
+		}
+		blockFrames, errBlock := claudeContentBlockFrames(index, block)
+		if errBlock != nil {
+			return nil, errBlock
+		}
+		frames = append(frames, blockFrames...)
+	}
+	deltaFrame, errDelta := claudeSSEFrame("message_delta", map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": root["stop_reason"], "stop_sequence": root["stop_sequence"]},
+		"usage": usage,
+	})
+	if errDelta != nil {
+		return nil, errDelta
+	}
+	frames = append(frames, deltaFrame)
+	stopFrame, errStop := claudeSSEFrame("message_stop", map[string]any{"type": "message_stop"})
+	if errStop != nil {
+		return nil, errStop
+	}
+	return append(frames, stopFrame), nil
+}
+
+// claudeContentBlockFrames expands one content block into start/delta/stop frames.
+// Text and thinking blocks stream incrementally; tool blocks stream their input as
+// partial JSON; every other block type is sent whole inside content_block_start.
+func claudeContentBlockFrames(index int, block map[string]any) ([][]byte, error) {
+	blockType, _ := block["type"].(string)
+	frames := make([][]byte, 0, 4)
+	switch blockType {
+	case "text", "thinking":
+		contentBlock := map[string]any{"type": blockType, blockType: ""}
+		citations, _ := block["citations"].([]any)
+		if len(citations) > 0 {
+			contentBlock["citations"] = []any{}
+		}
+		startFrame, errStart := claudeContentBlockStartFrame(index, contentBlock)
+		if errStart != nil {
+			return nil, errStart
+		}
+		frames = append(frames, startFrame)
+		if text, _ := block[blockType].(string); text != "" {
+			deltaFrame, errDelta := claudeContentBlockDeltaFrame(index, map[string]any{
+				"type":    blockType + "_delta",
+				blockType: text,
+			})
+			if errDelta != nil {
+				return nil, errDelta
+			}
+			frames = append(frames, deltaFrame)
+		}
+		if len(citations) > 0 {
+			for _, citation := range citations {
+				deltaFrame, errDelta := claudeContentBlockDeltaFrame(index, map[string]any{
+					"type":     "citations_delta",
+					"citation": citation,
+				})
+				if errDelta != nil {
+					return nil, errDelta
+				}
+				frames = append(frames, deltaFrame)
+			}
+		}
+		if signature, _ := block["signature"].(string); signature != "" {
+			deltaFrame, errDelta := claudeContentBlockDeltaFrame(index, map[string]any{
+				"type":      "signature_delta",
+				"signature": signature,
+			})
+			if errDelta != nil {
+				return nil, errDelta
+			}
+			frames = append(frames, deltaFrame)
+		}
+	case "tool_use", "server_tool_use":
+		startFrame, errStart := claudeContentBlockStartFrame(index, map[string]any{
+			"type":  blockType,
+			"id":    stringValue(block["id"]),
+			"name":  stringValue(block["name"]),
+			"input": map[string]any{},
+		})
+		if errStart != nil {
+			return nil, errStart
+		}
+		frames = append(frames, startFrame)
+		if rawInput, errMarshal := json.Marshal(claudeToolInput(block["input"])); errMarshal != nil {
+			return nil, fmt.Errorf("encode tool input: %w", errMarshal)
+		} else if !bytes.Equal(rawInput, []byte("{}")) && !bytes.Equal(rawInput, []byte("null")) {
+			deltaFrame, errDelta := claudeContentBlockDeltaFrame(index, map[string]any{
+				"type":         "input_json_delta",
+				"partial_json": string(rawInput),
+			})
+			if errDelta != nil {
+				return nil, errDelta
+			}
+			frames = append(frames, deltaFrame)
+		}
+	default:
+		startFrame, errStart := claudeContentBlockStartFrame(index, block)
+		if errStart != nil {
+			return nil, errStart
+		}
+		frames = append(frames, startFrame)
+	}
+	stopFrame, errStop := claudeSSEFrame("content_block_stop", map[string]any{
+		"type":  "content_block_stop",
+		"index": index,
+	})
+	if errStop != nil {
+		return nil, errStop
+	}
+	return append(frames, stopFrame), nil
+}
+
+// claudeStreamToResponse folds a Claude SSE stream back into one non-streaming
+// Anthropic Messages body. It fails when the stream is truncated (no message_stop)
+// or carries an error event, so a non-streaming client never receives a partial message.
+func claudeStreamToResponse(stream []byte) ([]byte, error) {
+	var (
+		message    map[string]any
+		usage      map[string]any
+		blocks     = make(map[int]map[string]any)
+		blockOrder []int
+		partials   = make(map[int]*strings.Builder)
+		stopReason any
+		stopSeq    any
+		hasStop    bool
+	)
+	for _, line := range bytes.Split(stream, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		event, errDecode := decodeJSONObject(payload)
+		if errDecode != nil {
+			return nil, fmt.Errorf("upstream stream line is not a JSON object: %w", errDecode)
+		}
+		switch eventType, _ := event["type"].(string); eventType {
+		case "message_start":
+			started, ok := event["message"].(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("upstream stream message_start has no message object")
+			}
+			message = started
+			if startedUsage, ok := started["usage"].(map[string]any); ok {
+				usage = cloneJSONObject(startedUsage)
+			}
+		case "content_block_start":
+			index, ok := jsonIndex(event["index"])
+			if !ok {
+				return nil, fmt.Errorf("upstream stream content_block_start has no index")
+			}
+			block, ok := event["content_block"].(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("upstream stream content_block_start has no content_block object")
+			}
+			if _, exists := blocks[index]; !exists {
+				blockOrder = append(blockOrder, index)
+			}
+			blocks[index] = block
+		case "content_block_delta":
+			index, ok := jsonIndex(event["index"])
+			delta, _ := event["delta"].(map[string]any)
+			if !ok || delta == nil {
+				continue
+			}
+			block, exists := blocks[index]
+			if !exists {
+				block = claudeBlockForDelta(delta)
+				blocks[index] = block
+				blockOrder = append(blockOrder, index)
+			}
+			switch deltaType, _ := delta["type"].(string); deltaType {
+			case "text_delta":
+				appendBlockString(block, "text", delta["text"])
+			case "thinking_delta":
+				appendBlockString(block, "thinking", delta["thinking"])
+			case "signature_delta":
+				appendBlockString(block, "signature", delta["signature"])
+			case "input_json_delta":
+				if partials[index] == nil {
+					partials[index] = &strings.Builder{}
+				}
+				partials[index].WriteString(stringValue(delta["partial_json"]))
+			case "citations_delta":
+				if citation, exists := delta["citation"]; exists {
+					citations, _ := block["citations"].([]any)
+					block["citations"] = append(citations, citation)
+				}
+			}
+		case "message_delta":
+			if delta, ok := event["delta"].(map[string]any); ok {
+				if value, exists := delta["stop_reason"]; exists {
+					stopReason = value
+				}
+				if value, exists := delta["stop_sequence"]; exists {
+					stopSeq = value
+				}
+			}
+			if update, ok := event["usage"].(map[string]any); ok {
+				usage = mergeClaudeUsage(usage, update)
+			}
+		case "message_stop":
+			hasStop = true
+		case "error":
+			errorObject, _ := event["error"].(map[string]any)
+			detail := stringValue(errorObject["message"])
+			if detail == "" {
+				detail = stringValue(errorObject["type"])
+			}
+			if detail == "" {
+				detail = "unknown upstream error"
+			}
+			return nil, fmt.Errorf("upstream stream error: %s", detail)
+		}
+	}
+	if message == nil {
+		return nil, fmt.Errorf("upstream stream is missing message_start")
+	}
+	if !hasStop {
+		return nil, fmt.Errorf("upstream stream ended before message_stop")
+	}
+	sort.Ints(blockOrder)
+	content := make([]any, 0, len(blockOrder))
+	for _, index := range blockOrder {
+		block := blocks[index]
+		if builder := partials[index]; builder != nil && builder.Len() > 0 {
+			input, errDecode := decodeJSONValue([]byte(builder.String()))
+			if errDecode != nil {
+				return nil, fmt.Errorf("upstream tool input is not valid JSON: %w", errDecode)
+			}
+			block["input"] = input
+		}
+		content = append(content, block)
+	}
+	message["content"] = content
+	message["stop_reason"] = stopReason
+	message["stop_sequence"] = stopSeq
+	message["usage"] = claudeUsageObject(usage)
+	return json.Marshal(message)
+}
+
+// claudeToolInput normalizes a tool_use input so an absent or null value still
+// serializes as the empty object Claude clients expect.
+func claudeToolInput(value any) any {
+	switch typed := value.(type) {
+	case nil:
+		return map[string]any{}
+	case map[string]any:
+		return typed
+	default:
+		return value
+	}
+}
+
+// claudeBlockForDelta rebuilds a content block when a delta arrives without its start.
+func claudeBlockForDelta(delta map[string]any) map[string]any {
+	switch deltaType, _ := delta["type"].(string); deltaType {
+	case "text_delta":
+		return map[string]any{"type": "text"}
+	case "thinking_delta":
+		return map[string]any{"type": "thinking"}
+	case "input_json_delta":
+		return map[string]any{"type": "tool_use"}
+	default:
+		return map[string]any{"type": "text"}
+	}
+}
+
+func appendBlockString(block map[string]any, key string, value any) {
+	block[key] = stringValue(block[key]) + stringValue(value)
+}
+
+// claudeUsageObject returns a Claude usage object carrying the standard counters.
+func claudeUsageObject(source any) map[string]any {
+	usage, _ := source.(map[string]any)
+	usage = cloneJSONObject(usage)
+	if _, exists := usage["input_tokens"]; !exists {
+		usage["input_tokens"] = json.Number("0")
+	}
+	if _, exists := usage["output_tokens"]; !exists {
+		usage["output_tokens"] = json.Number("0")
+	}
+	return usage
+}
+
+// mergeClaudeUsage overlays newer counters while keeping earlier non-zero values,
+// mirroring the host's stream usage merge.
+func mergeClaudeUsage(base, update map[string]any) map[string]any {
+	merged := cloneJSONObject(base)
+	for key, value := range update {
+		existing, exists := merged[key]
+		if !exists || isZeroJSONNumber(existing) {
+			merged[key] = value
+		}
+	}
+	return merged
+}
+
+func isZeroJSONNumber(value any) bool {
+	number, ok := value.(json.Number)
+	if !ok {
+		return false
+	}
+	parsed, errParse := number.Float64()
+	return errParse == nil && parsed == 0
+}
+
+func cloneJSONObject(source map[string]any) map[string]any {
+	clone := make(map[string]any, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
+func decodeJSONObject(raw []byte) (map[string]any, error) {
+	value, errDecode := decodeJSONValue(raw)
+	if errDecode != nil {
+		return nil, errDecode
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("expected a JSON object")
+	}
+	return object, nil
+}
+
+func decodeJSONValue(raw []byte) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if errDecode := decoder.Decode(&value); errDecode != nil {
+		return nil, errDecode
+	}
+	return value, nil
+}
+
+func jsonIndex(value any) (int, bool) {
+	number, ok := value.(json.Number)
+	if !ok {
+		return 0, false
+	}
+	index, errParse := number.Int64()
+	if errParse != nil {
+		return 0, false
+	}
+	return int(index), true
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 func prepareAnthropicPayload(payload []byte, upstreamModel string, stream bool) ([]byte, error) {
@@ -750,7 +1346,7 @@ func managementStatus(raw []byte) ([]byte, error) {
 	cfg := loadedConfig()
 	models := make([]string, 0, len(cfg.Models))
 	for _, model := range cfg.Models {
-		models = append(models, publicModelID(cfg, model)+" → "+model.Name)
+		models = append(models, publicModelID(cfg, model)+" → "+model.Name+" [stream: "+streamModeLabel(model)+"]")
 	}
 	sort.Strings(models)
 	var body bytes.Buffer

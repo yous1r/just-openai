@@ -16,6 +16,7 @@ If `base_api` already ends in `/v1`, the plugin does not add it again.
 - Maps a public alias back to the upstream OpenAI model name.
 - Accepts Anthropic `/v1/messages`; CLIProxyAPI can also translate OpenAI Chat Completions/Responses requests to Anthropic Messages before execution.
 - Supports streaming and non-streaming requests.
+- Per-model upstream mode pin (`stream: true|false`): a pinned model always uses that mode upstream, and the plugin bridges the difference in both directions — a streaming client gets synthesized Claude SSE from a non-streaming upstream, and a non-streaming client gets the upstream stream aggregated into one message.
 - Supports one key or round-robin across multiple keys.
 - Adds `Anthropic-Version` and uses `x-api-key`, Bearer, or both.
 
@@ -65,6 +66,7 @@ plugins:
           display_name: "GPT Pro via Anthropic"
           context_length: 200000
           max_output_tokens: 32000
+          stream: false         # optional per-model upstream mode pin
       headers: {}
 ```
 
@@ -73,6 +75,21 @@ With this example:
 - Public model: `omp/gpt-pro`
 - Upstream URL: `https://your-gateway.example.com/api/v1/messages`
 - Upstream request model: `gpt-5.4`
+- Upstream mode: always non-streaming, regardless of what the client asks for
+
+### Per-model `stream`
+
+`stream` is optional and has three states:
+
+| Value | Upstream mode | Effect |
+| --- | --- | --- |
+| unset | follows the client request | unchanged behaviour; streaming clients stream, others do not |
+| `true` | always streaming | the plugin requests `stream: true` even for a non-streaming client, then aggregates the upstream SSE into a single Claude message body |
+| `false` | always non-streaming | the plugin requests `stream: false` even for a streaming client, then replays the upstream message as the Claude SSE event sequence (`message_start` → per-block `content_block_start`/`content_block_delta`/`content_block_stop` → `message_delta` → `message_stop`) |
+
+Use it when an upstream gateway is unreliable in one mode: `stream: false` avoids long-lived streaming connections and provider-side buffering, while `stream: true` keeps a single request open and returns a complete message to non-streaming callers.
+
+Both bridge paths return an error instead of a partial result when the upstream fails: an upstream HTTP error, a truncated stream (no `message_stop`), or an `error` event in the stream is reported before any synthesized event reaches the client.
 
 You can edit the same values through the CLIProxyAPI management page. The plugin configuration APIs are also available at:
 
